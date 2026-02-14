@@ -1,0 +1,32 @@
+{
+  "name": "tool-organizer",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Upload photos of tools, extract outlines, arrange on a board, and export as DXF",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview"
+  },
+  "repository": {
+    "type": "git",
+    "url": "http://local_proxy@127.0.0.1:57645/git/tented812/Tool-Organizer"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "dxf-writer": "^1.18.4",
+    "fabric": "^7.1.0",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^5.1.4",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.1"
+  }
+}
