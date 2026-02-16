@@ -3,13 +3,17 @@ import type { Point, ToolOutline } from "../types";
 /**
  * Extract the outline contour of a tool from a photograph.
  *
- * Pipeline:
- *  1. Draw image to an off-screen canvas
- *  2. Convert to grayscale
- *  3. Threshold to binary (Otsu-style adaptive)
- *  4. Find the outer contour using Moore neighborhood tracing
- *  5. Simplify with Ramer-Douglas-Peucker
- *  6. Scale from pixels to inches using the provided calibration
+ * Robust pipeline:
+ *  1. Draw image to an off-screen canvas, scale down
+ *  2. Gaussian blur to eliminate texture (wood grain, fabric, etc.)
+ *  3. Multi-channel analysis: grayscale + saturation + color distance from border
+ *  4. Flood fill from all border pixels to identify background
+ *  5. Invert → foreground mask
+ *  6. Morphological open+close to clean up
+ *  7. Keep only the largest connected component
+ *  8. Moore neighborhood contour tracing
+ *  9. Simplify with Ramer-Douglas-Peucker
+ * 10. Scale from pixels to inches
  */
 
 /** Load an image file into an HTMLImageElement */
@@ -46,127 +50,226 @@ function getImageData(
   return { data: ctx.getImageData(0, 0, w, h), scale };
 }
 
-/** Convert RGBA image data to a grayscale Uint8Array */
-function toGrayscale(imageData: ImageData): Uint8Array {
-  const gray = new Uint8Array(imageData.width * imageData.height);
-  const d = imageData.data;
-  for (let i = 0; i < gray.length; i++) {
+/** Apply Gaussian blur to RGBA image data using the canvas built-in filter */
+function blurImageData(imageData: ImageData, radius: number): ImageData {
+  const { width: w, height: h } = imageData;
+  const canvas = document.createElement("canvas");
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext("2d")!;
+
+  // Draw the original image data
+  ctx.putImageData(imageData, 0, 0);
+
+  // Create a second canvas to apply blur
+  const canvas2 = document.createElement("canvas");
+  canvas2.width = w;
+  canvas2.height = h;
+  const ctx2 = canvas2.getContext("2d")!;
+  ctx2.filter = `blur(${radius}px)`;
+  ctx2.drawImage(canvas, 0, 0);
+
+  return ctx2.getImageData(0, 0, w, h);
+}
+
+/** Compute average RGB color from a set of pixel indices */
+function averageColor(
+  data: Uint8ClampedArray,
+  indices: number[]
+): [number, number, number] {
+  let r = 0,
+    g = 0,
+    b = 0;
+  for (const i of indices) {
     const off = i * 4;
-    gray[i] = Math.round(0.299 * d[off] + 0.587 * d[off + 1] + 0.114 * d[off + 2]);
+    r += data[off];
+    g += data[off + 1];
+    b += data[off + 2];
   }
-  return gray;
+  const n = indices.length;
+  return [r / n, g / n, b / n];
 }
 
-/** Compute Otsu's threshold */
-function otsuThreshold(gray: Uint8Array): number {
-  const hist = new Array(256).fill(0);
-  for (let i = 0; i < gray.length; i++) hist[gray[i]]++;
-
-  const total = gray.length;
-  let sum = 0;
-  for (let i = 0; i < 256; i++) sum += i * hist[i];
-
-  let sumB = 0;
-  let wB = 0;
-  let maxVar = 0;
-  let threshold = 0;
-
-  for (let i = 0; i < 256; i++) {
-    wB += hist[i];
-    if (wB === 0) continue;
-    const wF = total - wB;
-    if (wF === 0) break;
-
-    sumB += i * hist[i];
-    const mB = sumB / wB;
-    const mF = (sum - sumB) / wF;
-    const between = wB * wF * (mB - mF) * (mB - mF);
-    if (between > maxVar) {
-      maxVar = between;
-      threshold = i;
-    }
+/** Compute color distance (Euclidean in RGB) for each pixel vs a reference color */
+function colorDistanceMap(
+  data: Uint8ClampedArray,
+  pixelCount: number,
+  refR: number,
+  refG: number,
+  refB: number
+): Float32Array {
+  const dist = new Float32Array(pixelCount);
+  for (let i = 0; i < pixelCount; i++) {
+    const off = i * 4;
+    const dr = data[off] - refR;
+    const dg = data[off + 1] - refG;
+    const db = data[off + 2] - refB;
+    dist[i] = Math.sqrt(dr * dr + dg * dg + db * db);
   }
-  return threshold;
-}
-
-/** Threshold grayscale to binary (1 = foreground tool, 0 = background) */
-function toBinary(gray: Uint8Array, w: number, h: number): Uint8Array {
-  const thresh = otsuThreshold(gray);
-  const binary = new Uint8Array(w * h);
-
-  // Determine if the tool is darker or lighter than background.
-  // Check border pixels — they're most likely background.
-  let borderSum = 0;
-  let borderCount = 0;
-  for (let x = 0; x < w; x++) {
-    borderSum += gray[x];
-    borderSum += gray[(h - 1) * w + x];
-    borderCount += 2;
-  }
-  for (let y = 1; y < h - 1; y++) {
-    borderSum += gray[y * w];
-    borderSum += gray[y * w + w - 1];
-    borderCount += 2;
-  }
-  const borderMean = borderSum / borderCount;
-
-  // If border is bright, tool is dark → foreground = below threshold
-  // If border is dark, tool is bright → foreground = above threshold
-  const invertLogic = borderMean < thresh;
-
-  for (let i = 0; i < gray.length; i++) {
-    if (invertLogic) {
-      binary[i] = gray[i] > thresh ? 1 : 0;
-    } else {
-      binary[i] = gray[i] < thresh ? 1 : 0;
-    }
-  }
-
-  return binary;
+  return dist;
 }
 
 /**
- * Flood-fill the border with 0 to clean up any edge noise,
- * then find the largest connected foreground region.
+ * Flood fill from all border pixels to mark background.
+ * Uses a color-distance tolerance: a pixel is "background" if its color
+ * is within `tolerance` of an already-marked background neighbor.
  */
-function cleanBinary(binary: Uint8Array, w: number, h: number): Uint8Array {
-  // Simple morphological close (dilate then erode) to fill small gaps
-  const closed = new Uint8Array(binary);
+function floodFillBackground(
+  imageData: ImageData,
+  tolerance: number
+): Uint8Array {
+  const { width: w, height: h, data } = imageData;
+  const n = w * h;
+  const background = new Uint8Array(n); // 1 = background
 
-  // Dilate
-  const dilated = new Uint8Array(w * h);
+  // Seed: all border pixels
+  const queue: number[] = [];
+  for (let x = 0; x < w; x++) {
+    queue.push(x); // top row
+    queue.push((h - 1) * w + x); // bottom row
+    background[x] = 1;
+    background[(h - 1) * w + x] = 1;
+  }
   for (let y = 1; y < h - 1; y++) {
-    for (let x = 1; x < w - 1; x++) {
-      const idx = y * w + x;
-      if (
-        closed[idx] ||
-        closed[idx - 1] ||
-        closed[idx + 1] ||
-        closed[idx - w] ||
-        closed[idx + w]
-      ) {
-        dilated[idx] = 1;
+    queue.push(y * w); // left col
+    queue.push(y * w + w - 1); // right col
+    background[y * w] = 1;
+    background[y * w + w - 1] = 1;
+  }
+
+  const tolSq = tolerance * tolerance;
+
+  // BFS flood fill
+  let head = 0;
+  while (head < queue.length) {
+    const idx = queue[head++];
+    const x = idx % w;
+    const y = (idx - x) / w;
+    const off = idx * 4;
+    const r0 = data[off],
+      g0 = data[off + 1],
+      b0 = data[off + 2];
+
+    // 4-connected neighbors
+    const neighbors = [
+      x > 0 ? idx - 1 : -1,
+      x < w - 1 ? idx + 1 : -1,
+      y > 0 ? idx - w : -1,
+      y < h - 1 ? idx + w : -1,
+    ];
+
+    for (const ni of neighbors) {
+      if (ni < 0 || background[ni]) continue;
+      const noff = ni * 4;
+      const dr = data[noff] - r0;
+      const dg = data[noff + 1] - g0;
+      const db = data[noff + 2] - b0;
+      if (dr * dr + dg * dg + db * db <= tolSq) {
+        background[ni] = 1;
+        queue.push(ni);
       }
     }
   }
 
-  // Erode
+  return background;
+}
+
+/** Morphological operation with a square kernel of given radius */
+function dilate(binary: Uint8Array, w: number, h: number, radius: number): Uint8Array {
   const result = new Uint8Array(w * h);
-  for (let y = 1; y < h - 1; y++) {
-    for (let x = 1; x < w - 1; x++) {
-      const idx = y * w + x;
-      if (
-        dilated[idx] &&
-        dilated[idx - 1] &&
-        dilated[idx + 1] &&
-        dilated[idx - w] &&
-        dilated[idx + w]
-      ) {
-        result[idx] = 1;
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      let found = false;
+      for (let dy = -radius; dy <= radius && !found; dy++) {
+        for (let dx = -radius; dx <= radius && !found; dx++) {
+          const ny = y + dy,
+            nx = x + dx;
+          if (ny >= 0 && ny < h && nx >= 0 && nx < w && binary[ny * w + nx]) {
+            found = true;
+          }
+        }
       }
+      if (found) result[y * w + x] = 1;
+    }
+  }
+  return result;
+}
+
+function erode(binary: Uint8Array, w: number, h: number, radius: number): Uint8Array {
+  const result = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      let allSet = true;
+      for (let dy = -radius; dy <= radius && allSet; dy++) {
+        for (let dx = -radius; dx <= radius && allSet; dx++) {
+          const ny = y + dy,
+            nx = x + dx;
+          if (ny < 0 || ny >= h || nx < 0 || nx >= w || !binary[ny * w + nx]) {
+            allSet = false;
+          }
+        }
+      }
+      if (allSet) result[y * w + x] = 1;
+    }
+  }
+  return result;
+}
+
+/** Morphological close (dilate then erode) — fills small gaps */
+function morphClose(binary: Uint8Array, w: number, h: number, radius: number): Uint8Array {
+  return erode(dilate(binary, w, h, radius), w, h, radius);
+}
+
+/** Morphological open (erode then dilate) — removes small noise */
+function morphOpen(binary: Uint8Array, w: number, h: number, radius: number): Uint8Array {
+  return dilate(erode(binary, w, h, radius), w, h, radius);
+}
+
+/** Keep only the largest connected component (4-connected) */
+function largestComponent(binary: Uint8Array, w: number, h: number): Uint8Array {
+  const labels = new Int32Array(w * h);
+  let currentLabel = 0;
+  const componentSizes: Map<number, number> = new Map();
+
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const idx = y * w + x;
+      if (!binary[idx] || labels[idx]) continue;
+
+      currentLabel++;
+      let size = 0;
+      const stack = [idx];
+      while (stack.length > 0) {
+        const ci = stack.pop()!;
+        if (labels[ci]) continue;
+        labels[ci] = currentLabel;
+        size++;
+
+        const cx = ci % w;
+        const cy = (ci - cx) / w;
+        if (cx > 0 && binary[ci - 1] && !labels[ci - 1]) stack.push(ci - 1);
+        if (cx < w - 1 && binary[ci + 1] && !labels[ci + 1]) stack.push(ci + 1);
+        if (cy > 0 && binary[ci - w] && !labels[ci - w]) stack.push(ci - w);
+        if (cy < h - 1 && binary[ci + w] && !labels[ci + w]) stack.push(ci + w);
+      }
+      componentSizes.set(currentLabel, size);
     }
   }
 
+  // Find the largest
+  let bestLabel = 0;
+  let bestSize = 0;
+  for (const [label, size] of componentSizes) {
+    if (size > bestSize) {
+      bestSize = size;
+      bestLabel = label;
+    }
+  }
+
+  const result = new Uint8Array(w * h);
+  for (let i = 0; i < labels.length; i++) {
+    if (labels[i] === bestLabel) result[i] = 1;
+  }
   return result;
 }
 
@@ -193,14 +296,13 @@ function traceContour(binary: Uint8Array, w: number, h: number): Point[] {
   const contour: Point[] = [];
   let cx = startX,
     cy = startY;
-  let dir = 7; // start searching from up-right
+  let dir = 7;
 
   const maxIter = w * h * 2;
   for (let iter = 0; iter < maxIter; iter++) {
     contour.push({ x: cx, y: cy });
 
-    // Search for next boundary pixel
-    const searchStart = (dir + 5) % 8; // backtrack: start from dir-3 mod 8
+    const searchStart = (dir + 5) % 8;
     let found = false;
     for (let i = 0; i < 8; i++) {
       const d = (searchStart + i) % 8;
@@ -260,7 +362,7 @@ function simplify(points: Point[], epsilon: number): Point[] {
  * Extract a tool outline from an image file.
  * @param file - The image file to process
  * @param pixelsPerInch - Calibration: how many pixels in the original image equal 1 inch.
- *                        Default assumes a phone photo of a tool on a surface with ~30 px/in at processing scale.
+ *                        Default assumes longest tool dimension ≈ 10 inches.
  */
 export async function extractOutline(
   file: File,
@@ -270,20 +372,107 @@ export async function extractOutline(
   const { data: imageData, scale } = getImageData(img, 800);
   const { width: w, height: h } = imageData;
 
-  const gray = toGrayscale(imageData);
-  const binary = toBinary(gray, w, h);
-  const cleaned = cleanBinary(binary, w, h);
+  // Step 1: Heavy Gaussian blur to eliminate texture (wood grain, fabric, etc.)
+  const blurRadius = Math.max(3, Math.round(Math.max(w, h) * 0.01));
+  const blurred = blurImageData(imageData, blurRadius);
+
+  // Step 2: Compute average border color from the blurred image
+  const borderIndices: number[] = [];
+  for (let x = 0; x < w; x++) {
+    borderIndices.push(x);
+    borderIndices.push((h - 1) * w + x);
+  }
+  for (let y = 1; y < h - 1; y++) {
+    borderIndices.push(y * w);
+    borderIndices.push(y * w + w - 1);
+  }
+  const [bgR, bgG, bgB] = averageColor(blurred.data, borderIndices);
+
+  // Step 3: Flood fill from borders on the blurred image.
+  // Try multiple tolerances and pick the one that gives the best foreground region.
+  let bestForeground: Uint8Array | null = null;
+  let bestScore = -1;
+
+  for (const tol of [30, 40, 50, 60]) {
+    const bg = floodFillBackground(blurred, tol);
+
+    // Invert: foreground = !background
+    const fg = new Uint8Array(w * h);
+    let fgCount = 0;
+    for (let i = 0; i < fg.length; i++) {
+      if (!bg[i]) {
+        fg[i] = 1;
+        fgCount++;
+      }
+    }
+
+    const totalPixels = w * h;
+    const fgRatio = fgCount / totalPixels;
+
+    // Score: foreground should be a reasonable fraction (5%-80%) of the image
+    // and we want the foreground to have a meaningfully different color from background
+    if (fgRatio < 0.01 || fgRatio > 0.9) continue;
+
+    // Compute average foreground color distance from background
+    let colorDist = 0;
+    let cnt = 0;
+    for (let i = 0; i < fg.length; i++) {
+      if (fg[i]) {
+        const off = i * 4;
+        const dr = blurred.data[off] - bgR;
+        const dg = blurred.data[off + 1] - bgG;
+        const db = blurred.data[off + 2] - bgB;
+        colorDist += Math.sqrt(dr * dr + dg * dg + db * db);
+        cnt++;
+      }
+    }
+    const avgDist = cnt > 0 ? colorDist / cnt : 0;
+
+    // Prefer: reasonable foreground ratio + high color distance from background
+    const score = avgDist * Math.min(fgRatio, 1 - fgRatio);
+    if (score > bestScore) {
+      bestScore = score;
+      bestForeground = fg;
+    }
+  }
+
+  if (!bestForeground) {
+    // Fallback: use color distance thresholding
+    const distMap = colorDistanceMap(blurred.data, w * h, bgR, bgG, bgB);
+    // Find threshold via simple percentile
+    const sorted = Float32Array.from(distMap).sort();
+    const thresh = sorted[Math.floor(sorted.length * 0.7)];
+    bestForeground = new Uint8Array(w * h);
+    for (let i = 0; i < distMap.length; i++) {
+      if (distMap[i] > thresh) bestForeground[i] = 1;
+    }
+  }
+
+  // Step 4: Morphological cleanup
+  const morphRadius = Math.max(2, Math.round(Math.max(w, h) * 0.005));
+  let cleaned = morphOpen(bestForeground, w, h, morphRadius); // remove noise
+  cleaned = morphClose(cleaned, w, h, morphRadius * 2); // fill gaps
+
+  // Step 5: Keep only the largest connected component
+  cleaned = largestComponent(cleaned, w, h);
+
+  // Step 6: One more close to smooth the boundary
+  cleaned = morphClose(cleaned, w, h, morphRadius);
+
+  // Step 7: Trace contour
   const rawContour = traceContour(cleaned, w, h);
 
-  // Simplify — epsilon in pixels
-  const epsilon = Math.max(w, h) * 0.005;
+  // Step 8: Simplify
+  const epsilon = Math.max(w, h) * 0.004;
   const simplified = simplify(rawContour, epsilon);
 
   if (simplified.length < 3) {
-    throw new Error("Could not extract a meaningful outline from this image.");
+    throw new Error(
+      "Could not extract a meaningful outline. Try a photo with better contrast between the tool and background."
+    );
   }
 
-  // Compute bounding box in pixel space
+  // Compute bounding box
   let minX = Infinity,
     minY = Infinity,
     maxX = -Infinity,
@@ -298,11 +487,10 @@ export async function extractOutline(
   const pxWidth = maxX - minX;
   const pxHeight = maxY - minY;
 
-  // Default PPI: assume the tool is roughly 6-12 inches and takes up most of the frame
   const effectivePPI =
     pixelsPerInch != null
       ? pixelsPerInch * scale
-      : Math.max(pxWidth, pxHeight) / 10; // assume longest dimension ≈ 10 inches
+      : Math.max(pxWidth, pxHeight) / 10;
 
   const widthInches = pxWidth / effectivePPI;
   const heightInches = pxHeight / effectivePPI;
